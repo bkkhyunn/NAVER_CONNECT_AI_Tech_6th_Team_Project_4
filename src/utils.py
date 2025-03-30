@@ -1,10 +1,14 @@
 # python native
+import os
 import random
 
 # external library
 from PIL import Image
+import cv2
 import numpy as np
 from skimage.transform import resize
+from tqdm.auto import tqdm
+import wandb
 
 # torch
 import torch
@@ -20,8 +24,34 @@ def set_seed():
     torch.backends.cudnn.benchmark = False
     np.random.seed(RANDOM_SEED)
     random.seed(RANDOM_SEED)
+
+def dice_coef(y_true, y_pred):
+    y_true_f = y_true.flatten(2)
+    y_pred_f = y_pred.flatten(2)
+    intersection = torch.sum(y_true_f * y_pred_f, -1)
     
+    eps = 0.0001
+    return (2. * intersection + eps) / (torch.sum(y_true_f, -1) + torch.sum(y_pred_f, -1) + eps)
+
+# 모델 저장
+def save_model(model, save_dir, file_name='best.pt'):
+    os.makedirs(save_dir, exist_ok=True)
+    output_path = os.path.join(save_dir, file_name)
+    torch.save(model, output_path)
     
+# loss 튀는 구간 체크
+def loss_check(epoch, loss, pre_loss, file_list, save_dir, serial):
+    os.makedirs(os.path.join(save_dir, serial), exist_ok=True)
+    path = os.path.join(save_dir,serial,'loss_check.txt')
+    image_paths = '\n'.join([p for p in file_list])
+    with open(path, 'a', encoding='utf-8') as file:
+        file.write("="*10+f" train_{epoch+1} "+"="*10 +"\n")
+        file.write(f"loss : {loss}" + "\n")
+        file.write(f"pre_loss : {pre_loss}" + "\n")
+        file.write(f"increase : {loss - pre_loss}" + "\n")
+        file.write(image_paths + "\n")
+        file.write("\n")
+
 # for visualization -> 클래스가 2개 이상인 픽셀을 고려하지는 않음.
 PALETTE = [
     (220, 20, 60), (119, 11, 32), (0, 0, 142), (0, 0, 230), (106, 0, 228),
@@ -91,8 +121,32 @@ def fp2rgb(true, pred, image_np):
         result_image = Image.alpha_composite(result_image, Image.fromarray(image, 'RGBA'))
         
     return result_image
-    
 
-# confusion matrix
-def confusion_matrix():
-    return None
+# wandb 시각화
+def visualize_and_log_wandb(results, epoch, gray=False):
+    for result in tqdm(results, total=len(results)):
+        for output, mask, image, image_path in result:
+
+            output_np = output.numpy()
+            mask_np = mask.numpy()
+            image_np = np.array(image)
+            image_np = (image_np.transpose(1, 2, 0) * 255.).astype('uint8')
+            if gray:
+                image_np = cv2.cvtColor(image_np, cv2.COLOR_GRAY2RGB)
+            image_np = np.array(Image.fromarray(image_np).resize((512, 512)))
+            file_name = '/'.join(image_path.split('/')[-2:])
+
+            output_rgba = label2rgba(output_np, image_np)
+            mask_rgba = label2rgba(mask_np, image_np)
+            fp_rgba = fp2rgb(mask_np, output_np, image_np)
+            tn_rgba = tn2rgb(mask_np, output_np, image_np)
+            gt_img = image_np
+
+            #Log images to wandb
+            wandb.log({f"images on {epoch} epoch validation": 
+                    [wandb.Image(gt_img, caption=f"GT Image \n {file_name}"),
+                    wandb.Image(mask_rgba, caption="GT Mask"),
+                    wandb.Image(output_rgba, caption="Model Prediction"),
+                    wandb.Image(fp_rgba, caption="false positive"),
+                    wandb.Image(tn_rgba, caption="true negative")]
+                    })

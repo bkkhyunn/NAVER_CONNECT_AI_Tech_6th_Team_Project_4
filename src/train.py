@@ -17,12 +17,15 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Sampler,RandomSampler,SequentialSampler
 from torchvision import models
 from torchvision.transforms.functional import to_pil_image
+import segmentation_models_pytorch as smp
 
-from dataset import XRayDataset
-from utils import set_seed, label2rgba, fp2rgb, tn2rgb
-from loss import focal_loss, dice_loss, calc_loss
+from dataset import *
+from utils import set_seed, label2rgba, fp2rgb, tn2rgb, dice_coef
+from loss import BCEDiceLoss, CELoss
+from model import *
 import wandb
 
 import warnings
@@ -39,15 +42,6 @@ CLASSES = [
 ]
 CLASS2IND = {v: i for i, v in enumerate(CLASSES)}
 IND2CLASS = {v: k for k, v in CLASS2IND.items()}
-
-# dice
-def dice_coef(y_true, y_pred):
-    y_true_f = y_true.flatten(2)
-    y_pred_f = y_pred.flatten(2)
-    intersection = torch.sum(y_true_f * y_pred_f, -1)
-    
-    eps = 0.0001
-    return (2. * intersection + eps) / (torch.sum(y_true_f, -1) + torch.sum(y_pred_f, -1) + eps)
 
 # 모델 저장
 def save_model(model, save_dir, file_name='best.pt'):
@@ -105,16 +99,21 @@ def validation(epoch, model, val_loader, thr=0.5):
 
     dices = []
     results = []
+    matchs = []
     with torch.no_grad():
 
-        for step, (images, masks, image_paths) in tqdm(enumerate(val_loader), total=len(val_loader)):
-            images, masks = images.cuda(), masks.cuda()          
+        for step, (images, masks, image_paths, _) in tqdm(enumerate(val_loader), total=len(val_loader)):
+            images, masks = images.cuda(), masks.cuda()
             model = model.cuda()    
             
-            outputs = model(images)['out']
+            outputs = model(images)
             
             output_h, output_w = outputs.size(-2), outputs.size(-1)
             mask_h, mask_w = masks.size(-2), masks.size(-1)
+            
+            #pred = torch.argmax(label, dim=-1)
+            #acc_item = (aux_label == pred).sum().item()
+            #matchs.append(acc_item)
             
             # gt와 prediction의 크기가 다른 경우 prediction을 gt에 맞춰 interpolation
             if output_h != mask_h or output_w != mask_w:
@@ -137,8 +136,10 @@ def validation(epoch, model, val_loader, thr=0.5):
         f"{c:<12}: {d.item():.4f}"
         for c, d in zip(CLASSES, dices_per_class)
     ]
+    #acc = np.sum(matchs) / len(val_loader)
     dice_str = "\n".join(dice_str)
     print(dice_str)
+    #print('\n'+f'auxiliary acc : {acc}')
     
     avg_dice = torch.mean(dices_per_class).item()
 
@@ -155,27 +156,41 @@ def train(args, model, train_loader, val_loader, criterion, optimizer, scheduler
     n_class = len(CLASSES)
     best_dice = 0.
     serial = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    
+    #aux_criterion = CELoss()
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
     for epoch in range(args.num_epochs):
         model.train()
+        #matchs = 0
 
         pre_loss = 100.
-        for step, (images, masks, image_paths) in enumerate(train_loader):            
-            images, masks = images.cuda(), masks.cuda()    
+        for step, (images, masks, image_paths, _) in enumerate(train_loader):            
+            images, masks = images.cuda(), masks.cuda()
             model = model.cuda()        
-            outputs = model(images)['out']
+            #outputs = model(images)['out']
+            with torch.cuda.amp.autocast(enabled=True):
+                outputs = model(images)
+                loss = criterion(outputs, masks)
+            #aux_loss = aux_criterion(label, aux_label)
             
-            loss = criterion(outputs, masks)
+            #total_loss = loss + (aux_loss * 0.1)
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            #loss.backward()
+            scaler.step(optimizer)
+            #optimizer.step()
+            scaler.update()
+            
+            #pred = torch.argmax(label, dim=-1)
+            #matchs += (aux_label == pred).sum().item()
             
             if (step + 1) % 20 == 0:
                 print(
                     f'{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")} | '
                     f'Epoch [{epoch+1}/{args.num_epochs}], '
                     f'Step [{step+1}/{len(train_loader)}], '
-                    f'Loss: {round(loss.item(),4)}'
+                    f'Loss: {round(loss.item(),4)}, '
+                    #f'acc: {matchs / (args.batch_size) / 20}, '
+                    #f'total_Loss: {round(total_loss.item(),4)}'
                 )
                 current_lr = optimizer.param_groups[0]['lr']
                 wandb.log({'Loss': round(loss.item(),4), 'learning rate':current_lr})
@@ -185,6 +200,8 @@ def train(args, model, train_loader, val_loader, criterion, optimizer, scheduler
                     pre_loss = round(loss.item(), 4)
                 else:
                     pre_loss = round(loss.item(), 4)
+                    
+                matchs = 0
              
         scheduler.step()
         
@@ -226,6 +243,7 @@ def parse_args():
     parser.add_argument('--num_epochs', type=int, default=20)
     parser.add_argument('--val_interval', type=int, default=20)
     parser.add_argument('--gray', type=bool, default=False)
+    parser.add_argument('--ms_train', type=bool, default=False)
     args = parser.parse_args()
 
     return args
@@ -237,38 +255,81 @@ def main(args):
     set_seed()
     
     # transform 정의
-    tf = A.Resize(512, 512)
+    tf = A.Resize(2048, 2048)
+    #tf = A.Compose([A.GridDistortion(p=0.3)])
     
-    train_dataset = XRayDataset(args.image_root, args.label_root, is_train=True, transforms=tf, gray=args.gray)
-    valid_dataset = XRayDataset(args.image_root, args.label_root, is_train=False, transforms=tf, gray=args.gray)
+    if args.ms_train:
+        train_dataset = XRayMultiScaleDataset(args.image_root, args.label_root, is_train=True, transforms=None, gray=args.gray)
+        valid_dataset = XRayMultiScaleDataset(args.image_root, args.label_root, is_train=False, transforms=None, gray=args.gray)
+        
+        train_loader = DataLoader(
+            dataset=train_dataset,
+            batch_sampler=BatchSampler(SequentialSampler(train_dataset),
+                                    batch_size=args.batch_size,
+                                    multiscale_step=1,
+                                    drop_last=True,
+                                    img_sizes=[512, 768, 1024]),
+            num_workers=args.batch_size,
+        )
+        
+        valid_loader = DataLoader(
+            dataset=valid_dataset, 
+            batch_size=2,
+            shuffle=False,
+            num_workers=2,
+            drop_last=False
+        )
+        
+    else:
+        train_dataset = XRayDataset(args.image_root, args.label_root, is_train=True, transforms=tf, gray=args.gray)
+        valid_dataset = XRayDataset(args.image_root, args.label_root, is_train=False,  transforms=tf, gray=args.gray)
 
-    train_loader = DataLoader(
-        dataset=train_dataset, 
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=8,
-        drop_last=True,
-    )
-    
-    valid_loader = DataLoader(
-        dataset=valid_dataset, 
-        batch_size=2,
-        shuffle=False,
-        num_workers=2,
-        drop_last=False
-    )
+        train_loader = DataLoader(
+            dataset=train_dataset, 
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.batch_size,
+            drop_last=True,
+        )
+        
+        valid_loader = DataLoader(
+            dataset=valid_dataset, 
+            batch_size=2,
+            shuffle=False,
+            num_workers=2,
+            drop_last=False
+        )
     
     #model = models.segmentation.fcn_resnet101(pretrained=True)
     #model.classifier[4] = nn.Conv2d(512, len(CLASSES), kernel_size=1)
+    # model = models.segmentation.deeplabv3_resnet101(pretrained=True)
+    # model.classifier[-1] = torch.nn.Conv2d(256, len(CLASSES), kernel_size=(1, 1))
+    aux_params=dict(
+        pooling='max',            
+        dropout=0.5,              
+        activation='softmax',     
+        classes=3,                
+    )
     
-    model = models.segmentation.deeplabv3_resnet101(pretrained=True)
-    model.classifier[-1] = torch.nn.Conv2d(256, len(CLASSES), kernel_size=(1, 1))
+    model = smp.DeepLabV3(
+        encoder_name='resnet101',
+        encoder_weights="imagenet",
+        in_channels=1,
+        classes=len(CLASSES),
+        aux_params=aux_params
+    )
+    model = HRUNet3Plus(n_channels=1)
     
-    criterion = calc_loss
-    optimizer = optim.Adam(params=model.parameters(), lr=args.lr, weight_decay=1e-6)
+    if args.gray:
+        pass
     
-    scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[args.num_epochs//2], gamma=0.1)
-    #scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs//4, eta_min=1e-5)
+    criterion = BCEDiceLoss(bce_weight=1)
+    #optimizer = optim.Adam(params=model.parameters(), lr=args.lr, weight_decay=1e-6)
+    optimizer = optim.AdamW(params=model.parameters(), lr=args.lr, weight_decay=1e-6)
+    #optimizer = optim.SGD(params=model.parameters(), lr=args.lr, momentum=0.9, weight_decay=0.0005)
+    
+    #scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[args.num_epochs//2], gamma=0.1)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs//4, eta_min=1e-6)
     
     train(args, model, train_loader, valid_loader, criterion, optimizer, scheduler)
 
@@ -277,7 +338,7 @@ if __name__ == '__main__':
     
     wandb.init(project="CV06_Segmantation",
                #entity="innovation-vision-tech",
-               name=f"deeplabv3_resnet101_{args.num_epochs}e_calcloss(dice3,bce1)_adam_MultiStepLR_shuffle_false",
+               name=f"smp_UNet3+_HRNet_w32_{args.num_epochs}e_BCEDicecloss(dice3,bce1)_AdamW_CosineAnealingLR_shuffle_false_ms_train",
                notes="",
                config={
                     "batch_size": args.batch_size,
